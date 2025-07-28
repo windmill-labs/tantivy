@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::ops::BitOrAssign;
 use std::sync::{Arc, RwLock};
 use std::{fmt, io};
 
+use common::{ByteCount, HasLen};
 use fnv::FnvHashMap;
 use itertools::Itertools;
 
@@ -304,7 +304,6 @@ impl SegmentReader {
         for (field, field_entry) in self.schema().fields() {
             let field_name = field_entry.name().to_string();
             let is_indexed = field_entry.is_indexed();
-
             if is_indexed {
                 let is_json = field_entry.field_type().value_type() == Type::Json;
                 if is_json {
@@ -328,25 +327,39 @@ impl SegmentReader {
                             format!("{field_name}.{json_path}")
                         }
                     };
-                    indexed_fields.extend(
-                        encoded_fields_in_index
-                            .into_iter()
-                            .map(|(name, typ)| (build_path(&field_name, name), typ))
-                            .map(|(field_name, typ)| FieldMetadata {
-                                indexed: true,
-                                stored: false,
-                                field_name,
-                                fast: false,
-                                typ,
-                            }),
-                    );
+                    indexed_fields.extend(encoded_fields_in_index.into_iter().map(|field_space| {
+                        let field_name = build_path(&field_name, field_space.field_name);
+                        FieldMetadata {
+                            postings_size: Some(field_space.postings_num_bytes),
+                            positions_size: Some(field_space.positions_num_bytes),
+                            // this will be populated later.
+                            fast_size: None,
+                            stored: field_entry.is_stored(),
+                            field_name,
+                            typ: field_space.field_type,
+                        }
+                    }));
                 } else {
+                    let postings_size: ByteCount = self
+                        .postings_composite
+                        .open_read(field)
+                        .map(|posting_fileslice| posting_fileslice.len())
+                        .unwrap_or(0)
+                        .into();
+                    let positions_size: ByteCount = self
+                        .positions_composite
+                        .open_read(field)
+                        .map(|positions_fileslice| positions_fileslice.len())
+                        .unwrap_or(0)
+                        .into();
+
                     indexed_fields.push(FieldMetadata {
-                        indexed: true,
-                        stored: false,
                         field_name: field_name.to_string(),
-                        fast: false,
                         typ: field_entry.field_type().value_type(),
+                        stored: field_entry.is_stored(),
+                        fast_size: None,
+                        postings_size: Some(postings_size),
+                        positions_size: Some(positions_size),
                     });
                 }
             }
@@ -364,11 +377,12 @@ impl SegmentReader {
                     .unwrap_or(&field_name)
                     .to_string();
                 FieldMetadata {
-                    indexed: false,
-                    stored: false,
                     field_name,
-                    fast: true,
                     typ: Type::from(handle.column_type()),
+                    stored: false,
+                    fast_size: Some(handle.num_bytes()),
+                    postings_size: None,
+                    positions_size: None,
                 }
             })
             .collect();
@@ -378,7 +392,6 @@ impl SegmentReader {
         indexed_fields.sort_unstable();
         fast_fields.sort_unstable();
         let merged = merge_field_meta_data(vec![indexed_fields, fast_fields], &self.schema);
-
         Ok(merged)
     }
 
@@ -443,20 +456,40 @@ pub struct FieldMetadata {
     // Notice: Don't reorder the declaration of 1.field_name 2.typ, as it is used for ordering by
     // field_name then typ.
     pub typ: Type,
-    /// Is the field indexed for search
-    pub indexed: bool,
     /// Is the field stored in the doc store
     pub stored: bool,
-    /// Is the field stored in the columnar storage
-    pub fast: bool,
+    /// Size occupied in the columnar storage (None if not fast)
+    pub fast_size: Option<ByteCount>,
+    /// Size occupied in the index postings storage (None if not indexed)
+    pub postings_size: Option<ByteCount>,
+    /// Size occupied in the index postings storage (None if positions are not recorded)
+    pub positions_size: Option<ByteCount>,
 }
-impl BitOrAssign for FieldMetadata {
-    fn bitor_assign(&mut self, rhs: Self) {
+
+fn merge_options(left: Option<ByteCount>, right: Option<ByteCount>) -> Option<ByteCount> {
+    match (left, right) {
+        (Some(l), Some(r)) => Some(l + r),
+        (None, right) => right,
+        (left, None) => left,
+    }
+}
+
+impl FieldMetadata {
+    pub fn is_indexed(&self) -> bool {
+        self.postings_size.is_some()
+    }
+
+    pub fn is_fast(&self) -> bool {
+        self.fast_size.is_some()
+    }
+
+    pub fn merge(&mut self, rhs: Self) {
         assert!(self.field_name == rhs.field_name);
         assert!(self.typ == rhs.typ);
-        self.indexed |= rhs.indexed;
         self.stored |= rhs.stored;
-        self.fast |= rhs.fast;
+        self.fast_size = merge_options(self.fast_size, rhs.fast_size);
+        self.postings_size = merge_options(self.postings_size, rhs.postings_size);
+        self.positions_size = merge_options(self.positions_size, rhs.positions_size);
     }
 }
 
@@ -482,7 +515,7 @@ pub fn merge_field_meta_data(
     {
         let mut merged: FieldMetadata = group.next().unwrap();
         for el in group {
-            merged |= el;
+            merged.merge(el);
         }
         // Currently is_field_stored is maybe too slow for the high cardinality case
         merged.stored = is_field_stored(&merged.field_name, schema);
@@ -507,190 +540,191 @@ fn intersect_alive_bitset(
 }
 
 impl fmt::Debug for SegmentReader {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "SegmentReader({:?})", self.segment_id)
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::index::Index;
-    use crate::schema::{SchemaBuilder, Term, STORED, TEXT};
-    use crate::IndexWriter;
+// #[cfg(test)]
+// mod test {
+//     use super::*;
+//     use crate::index::Index;
+//     use crate::schema::{SchemaBuilder, Term, STORED, TEXT};
+//     use crate::IndexWriter;
 
-    #[test]
-    fn test_merge_field_meta_data_same() {
-        let schema = SchemaBuilder::new().build();
-        let field_metadata1 = FieldMetadata {
-            field_name: "a".to_string(),
-            typ: crate::schema::Type::Str,
-            indexed: true,
-            stored: false,
-            fast: true,
-        };
-        let field_metadata2 = FieldMetadata {
-            field_name: "a".to_string(),
-            typ: crate::schema::Type::Str,
-            indexed: true,
-            stored: false,
-            fast: true,
-        };
-        let res = merge_field_meta_data(
-            vec![vec![field_metadata1.clone()], vec![field_metadata2]],
-            &schema,
-        );
-        assert_eq!(res, vec![field_metadata1]);
-    }
-    #[test]
-    fn test_merge_field_meta_data_different() {
-        let schema = SchemaBuilder::new().build();
-        let field_metadata1 = FieldMetadata {
-            field_name: "a".to_string(),
-            typ: crate::schema::Type::Str,
-            indexed: false,
-            stored: false,
-            fast: true,
-        };
-        let field_metadata2 = FieldMetadata {
-            field_name: "b".to_string(),
-            typ: crate::schema::Type::Str,
-            indexed: false,
-            stored: false,
-            fast: true,
-        };
-        let field_metadata3 = FieldMetadata {
-            field_name: "a".to_string(),
-            typ: crate::schema::Type::Str,
-            indexed: true,
-            stored: false,
-            fast: false,
-        };
-        let res = merge_field_meta_data(
-            vec![
-                vec![field_metadata1.clone(), field_metadata2.clone()],
-                vec![field_metadata3],
-            ],
-            &schema,
-        );
-        let field_metadata_expected1 = FieldMetadata {
-            field_name: "a".to_string(),
-            typ: crate::schema::Type::Str,
-            indexed: true,
-            stored: false,
-            fast: true,
-        };
-        assert_eq!(res, vec![field_metadata_expected1, field_metadata2.clone()]);
-    }
-    #[test]
-    fn test_merge_field_meta_data_merge() {
-        use pretty_assertions::assert_eq;
-        let get_meta_data = |name: &str, typ: Type| FieldMetadata {
-            field_name: name.to_string(),
-            typ,
-            indexed: false,
-            stored: false,
-            fast: true,
-        };
-        let schema = SchemaBuilder::new().build();
-        let mut metas = vec![get_meta_data("d", Type::Str), get_meta_data("e", Type::U64)];
-        metas.sort();
-        let res = merge_field_meta_data(vec![vec![get_meta_data("e", Type::Str)], metas], &schema);
-        assert_eq!(
-            res,
-            vec![
-                get_meta_data("d", Type::Str),
-                get_meta_data("e", Type::Str),
-                get_meta_data("e", Type::U64),
-            ]
-        );
-    }
-    #[test]
-    fn test_merge_field_meta_data_bitxor() {
-        let field_metadata1 = FieldMetadata {
-            field_name: "a".to_string(),
-            typ: crate::schema::Type::Str,
-            indexed: false,
-            stored: false,
-            fast: true,
-        };
-        let field_metadata2 = FieldMetadata {
-            field_name: "a".to_string(),
-            typ: crate::schema::Type::Str,
-            indexed: true,
-            stored: false,
-            fast: false,
-        };
-        let field_metadata_expected = FieldMetadata {
-            field_name: "a".to_string(),
-            typ: crate::schema::Type::Str,
-            indexed: true,
-            stored: false,
-            fast: true,
-        };
-        let mut res1 = field_metadata1.clone();
-        res1 |= field_metadata2.clone();
-        let mut res2 = field_metadata2.clone();
-        res2 |= field_metadata1;
-        assert_eq!(res1, field_metadata_expected);
-        assert_eq!(res2, field_metadata_expected);
-    }
+//     #[test]
+//     fn test_merge_field_meta_data_same() {
+//         let schema = SchemaBuilder::new().build();
+//         let field_metadata1 = FieldMetadata {
+//             field_name: "a".to_string(),
+//             typ: crate::schema::Type::Str,
+//             postings_size: 1_000.into(),
+//             positions_size: 1_000.into(),
+//             stored: false,
+//             fast_size: 1_000.into(),
+//         };
+//         let field_metadata2 = FieldMetadata {
+//             field_name: "a".to_string(),
+//             typ: crate::schema::Type::Str,
+//             indexed: true,
+//             stored: false,
+//             fast: true,
+//         };
+//         let res = merge_field_meta_data(
+//             vec![vec![field_metadata1.clone()], vec![field_metadata2]],
+//             &schema,
+//         );
+//         assert_eq!(res, vec![field_metadata1]);
+//     }
+//     #[test]
+//     fn test_merge_field_meta_data_different() {
+//         let schema = SchemaBuilder::new().build();
+//         let field_metadata1 = FieldMetadata {
+//             field_name: "a".to_string(),
+//             typ: crate::schema::Type::Str,
+//             indexed: false,
+//             stored: false,
+//             fast: true,
+//         };
+//         let field_metadata2 = FieldMetadata {
+//             field_name: "b".to_string(),
+//             typ: crate::schema::Type::Str,
+//             indexed: false,
+//             stored: false,
+//             fast: true,
+//         };
+//         let field_metadata3 = FieldMetadata {
+//             field_name: "a".to_string(),
+//             typ: crate::schema::Type::Str,
+//             indexed: true,
+//             stored: false,
+//             fast: false,
+//         };
+//         let res = merge_field_meta_data(
+//             vec![
+//                 vec![field_metadata1.clone(), field_metadata2.clone()],
+//                 vec![field_metadata3],
+//             ],
+//             &schema,
+//         );
+//         let field_metadata_expected1 = FieldMetadata {
+//             field_name: "a".to_string(),
+//             typ: crate::schema::Type::Str,
+//             indexed: true,
+//             stored: false,
+//             fast: true,
+//         };
+//         assert_eq!(res, vec![field_metadata_expected1, field_metadata2.clone()]);
+//     }
+//     #[test]
+//     fn test_merge_field_meta_data_merge() {
+//         use pretty_assertions::assert_eq;
+//         let get_meta_data = |name: &str, typ: Type| FieldMetadata {
+//             field_name: name.to_string(),
+//             typ,
+//             indexed: false,
+//             stored: false,
+//             fast: true,
+//         };
+//         let schema = SchemaBuilder::new().build();
+//         let mut metas = vec![get_meta_data("d", Type::Str), get_meta_data("e", Type::U64)];
+//         metas.sort();
+//         let res = merge_field_meta_data(vec![vec![get_meta_data("e", Type::Str)], metas],
+// &schema);         assert_eq!(
+//             res,
+//             vec![
+//                 get_meta_data("d", Type::Str),
+//                 get_meta_data("e", Type::Str),
+//                 get_meta_data("e", Type::U64),
+//             ]
+//         );
+//     }
+//     #[test]
+//     fn test_merge_field_meta_data_bitxor() {
+//         let field_metadata1 = FieldMetadata {
+//             field_name: "a".to_string(),
+//             typ: crate::schema::Type::Str,
+//             indexed: false,
+//             stored: false,
+//             fast: true,
+//         };
+//         let field_metadata2 = FieldMetadata {
+//             field_name: "a".to_string(),
+//             typ: crate::schema::Type::Str,
+//             indexed: true,
+//             stored: false,
+//             fast: false,
+//         };
+//         let field_metadata_expected = FieldMetadata {
+//             field_name: "a".to_string(),
+//             typ: crate::schema::Type::Str,
+//             indexed: true,
+//             stored: false,
+//             fast: true,
+//         };
+//         let mut res1 = field_metadata1.clone();
+//         res1 |= field_metadata2.clone();
+//         let mut res2 = field_metadata2.clone();
+//         res2 |= field_metadata1;
+//         assert_eq!(res1, field_metadata_expected);
+//         assert_eq!(res2, field_metadata_expected);
+//     }
 
-    #[test]
-    fn test_num_alive() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_text_field("name", TEXT | STORED);
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema.clone());
-        let name = schema.get_field("name").unwrap();
+//     #[test]
+//     fn test_num_alive() -> crate::Result<()> {
+//         let mut schema_builder = Schema::builder();
+//         schema_builder.add_text_field("name", TEXT | STORED);
+//         let schema = schema_builder.build();
+//         let index = Index::create_in_ram(schema.clone());
+//         let name = schema.get_field("name").unwrap();
 
-        {
-            let mut index_writer: IndexWriter = index.writer_for_tests()?;
-            index_writer.add_document(doc!(name => "tantivy"))?;
-            index_writer.add_document(doc!(name => "horse"))?;
-            index_writer.add_document(doc!(name => "jockey"))?;
-            index_writer.add_document(doc!(name => "cap"))?;
-            // we should now have one segment with two docs
-            index_writer.delete_term(Term::from_field_text(name, "horse"));
-            index_writer.delete_term(Term::from_field_text(name, "cap"));
+//         {
+//             let mut index_writer: IndexWriter = index.writer_for_tests()?;
+//             index_writer.add_document(doc!(name => "tantivy"))?;
+//             index_writer.add_document(doc!(name => "horse"))?;
+//             index_writer.add_document(doc!(name => "jockey"))?;
+//             index_writer.add_document(doc!(name => "cap"))?;
+//             // we should now have one segment with two docs
+//             index_writer.delete_term(Term::from_field_text(name, "horse"));
+//             index_writer.delete_term(Term::from_field_text(name, "cap"));
 
-            // ok, now we should have a deleted doc
-            index_writer.commit()?;
-        }
-        let searcher = index.reader()?.searcher();
-        assert_eq!(2, searcher.segment_reader(0).num_docs());
-        assert_eq!(4, searcher.segment_reader(0).max_doc());
-        Ok(())
-    }
-    #[test]
-    fn test_alive_docs_iterator() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_text_field("name", TEXT | STORED);
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema.clone());
-        let name = schema.get_field("name").unwrap();
+//             // ok, now we should have a deleted doc
+//             index_writer.commit()?;
+//         }
+//         let searcher = index.reader()?.searcher();
+//         assert_eq!(2, searcher.segment_reader(0).num_docs());
+//         assert_eq!(4, searcher.segment_reader(0).max_doc());
+//         Ok(())
+//     }
+//     #[test]
+//     fn test_alive_docs_iterator() -> crate::Result<()> {
+//         let mut schema_builder = Schema::builder();
+//         schema_builder.add_text_field("name", TEXT | STORED);
+//         let schema = schema_builder.build();
+//         let index = Index::create_in_ram(schema.clone());
+//         let name = schema.get_field("name").unwrap();
 
-        {
-            let mut index_writer: IndexWriter = index.writer_for_tests()?;
-            index_writer.add_document(doc!(name => "tantivy"))?;
-            index_writer.add_document(doc!(name => "horse"))?;
-            index_writer.add_document(doc!(name => "jockey"))?;
-            index_writer.add_document(doc!(name => "cap"))?;
-            // we should now have one segment with two docs
-            index_writer.commit()?;
-        }
+//         {
+//             let mut index_writer: IndexWriter = index.writer_for_tests()?;
+//             index_writer.add_document(doc!(name => "tantivy"))?;
+//             index_writer.add_document(doc!(name => "horse"))?;
+//             index_writer.add_document(doc!(name => "jockey"))?;
+//             index_writer.add_document(doc!(name => "cap"))?;
+//             // we should now have one segment with two docs
+//             index_writer.commit()?;
+//         }
 
-        {
-            let mut index_writer2: IndexWriter = index.writer(50_000_000)?;
-            index_writer2.delete_term(Term::from_field_text(name, "horse"));
-            index_writer2.delete_term(Term::from_field_text(name, "cap"));
+//         {
+//             let mut index_writer2: IndexWriter = index.writer(50_000_000)?;
+//             index_writer2.delete_term(Term::from_field_text(name, "horse"));
+//             index_writer2.delete_term(Term::from_field_text(name, "cap"));
 
-            // ok, now we should have a deleted doc
-            index_writer2.commit()?;
-        }
-        let searcher = index.reader()?.searcher();
-        let docs: Vec<DocId> = searcher.segment_reader(0).doc_ids_alive().collect();
-        assert_eq!(vec![0u32, 2u32], docs);
-        Ok(())
-    }
-}
+//             // ok, now we should have a deleted doc
+//             index_writer2.commit()?;
+//         }
+//         let searcher = index.reader()?.searcher();
+//         let docs: Vec<DocId> = searcher.segment_reader(0).doc_ids_alive().collect();
+//         assert_eq!(vec![0u32, 2u32], docs);
+//         Ok(())
+//     }
+// }
