@@ -447,13 +447,16 @@ impl<D: Document> IndexWriter<D> {
                         return Ok(());
                     }
 
-                    index_documents(
+                    if let Err(e) = index_documents(
                         mem_budget,
                         index.new_segment(),
                         &mut document_iterator,
                         &segment_updater,
                         delete_cursor.clone(),
-                    )?;
+                    ) {
+                        println!("error indexing document, skipping: {e:?}");
+                        error!("error indexing document, skipping: {e:?}");
+                    }
                 }
             })?;
         self.worker_id += 1;
