@@ -128,12 +128,15 @@ impl Weight for FastFieldRangeWeight {
                         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                     )
                 }
-                Type::Bool | Type::Facet | Type::Bytes | Type::Json | Type::IpAddr => {
-                    Err(crate::TantivyError::InvalidArgument(format!(
-                        "unsupported value bytes type in json term value_bytes {:?}",
-                        term_value.typ()
-                    )))
-                }
+                Type::Bool
+                | Type::Facet
+                | Type::Bytes
+                | Type::Json
+                | Type::IpAddr
+                | Type::Custom => Err(crate::TantivyError::InvalidArgument(format!(
+                    "unsupported value bytes type in json term value_bytes {:?}",
+                    term_value.typ()
+                ))),
             }
         } else if field_type.is_ip_addr() {
             let parse_ip_from_bytes = |term: &Term| {
@@ -454,7 +457,7 @@ pub(crate) fn maps_to_u64_fastfield(typ: Type) -> bool {
     match typ {
         Type::U64 | Type::I64 | Type::F64 | Type::Bool | Type::Date => true,
         Type::IpAddr => false,
-        Type::Str | Type::Facet | Type::Bytes | Type::Json => false,
+        Type::Str | Type::Facet | Type::Bytes | Type::Json | Type::Custom => false,
     }
 }
 
@@ -1364,21 +1367,21 @@ mod tests {
                 "{} AND {}:{}",
                 gen_query_inclusive("id", ids[0]..=ids[1]),
                 field_path("id_name"),
-                &id_filter
+                id_filter
             );
             assert_eq!(get_num_hits(query_from_text(&query)), expected_num_hits);
             let query = format!(
                 "{} AND {}:{}",
                 gen_query_inclusive("id_f64", ids[0]..=ids[1]),
                 field_path("id_name"),
-                &id_filter
+                id_filter
             );
             assert_eq!(get_num_hits(query_from_text(&query)), expected_num_hits);
             let query = format!(
                 "{} AND {}:{}",
                 gen_query_inclusive("id_i64", ids[0]..=ids[1]),
                 field_path("id_name"),
-                &id_filter
+                id_filter
             );
             assert_eq!(get_num_hits(query_from_text(&query)), expected_num_hits);
 
@@ -1388,21 +1391,21 @@ mod tests {
                 "{} AND {}:{}",
                 gen_query_inclusive("ids", ids[0]..=ids[1]),
                 field_path("id_name"),
-                &id_filter
+                id_filter
             );
             assert_eq!(get_num_hits(query_from_text(&query)), expected_num_hits);
             let query = format!(
                 "{} AND {}:{}",
                 gen_query_inclusive("ids_f64", ids[0]..=ids[1]),
                 field_path("id_name"),
-                &id_filter
+                id_filter
             );
             assert_eq!(get_num_hits(query_from_text(&query)), expected_num_hits);
             let query = format!(
                 "{} AND {}:{}",
                 gen_query_inclusive("ids_i64", ids[0]..=ids[1]),
                 field_path("id_name"),
-                &id_filter
+                id_filter
             );
             assert_eq!(get_num_hits(query_from_text(&query)), expected_num_hits);
         };
@@ -1651,7 +1654,7 @@ pub(crate) mod ip_range_tests {
             let query = format!(
                 "{} AND id:{}",
                 gen_query_inclusive("ip", &ip_range),
-                &id_filter
+                id_filter
             );
             assert_eq!(get_num_hits(query_from_text(&query)), expected_num_hits);
 
@@ -1660,7 +1663,7 @@ pub(crate) mod ip_range_tests {
             let query = format!(
                 "{} AND id:{}",
                 gen_query_inclusive("ips", &ip_range),
-                &id_filter
+                id_filter
             );
             assert_eq!(get_num_hits(query_from_text(&query)), expected_num_hits);
         };

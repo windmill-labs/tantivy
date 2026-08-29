@@ -176,6 +176,15 @@ fn format_percentile(percentile: f64) -> String {
 }
 
 impl PercentilesCollector {
+    /// Returns the value at the given percentile (0–100). Returns `None` when the sketch is empty.
+    pub(crate) fn get_percentile(&self, percentile: f64) -> crate::Result<Option<f64>> {
+        self.sketch.quantile(percentile / 100.0).map_err(|err| {
+            TantivyError::AggregationError(crate::aggregation::AggregationError::InvalidRequest(
+                format!("percentile {percentile} out of range: {err}"),
+            ))
+        })
+    }
+
     /// Convert result into final result. This will query the quantils from the underlying quantil
     /// collector.
     pub fn into_final_result(self, req: &PercentilesAggregationReq) -> PercentilesMetricResult {
@@ -311,6 +320,26 @@ impl SegmentAggregationCollector for SegmentPercentilesCollector {
             self.buckets.push(PercentilesCollector::new());
         }
         Ok(())
+    }
+
+    fn compute_metric_value(
+        &self,
+        bucket_id: BucketId,
+        sub_agg_name: &str,
+        sub_agg_property: &str,
+        agg_data: &AggregationsSegmentCtx,
+    ) -> Option<f64> {
+        if agg_data.get_metric_req_data(self.accessor_idx).name != sub_agg_name {
+            return None;
+        }
+        let percentile: f64 = sub_agg_property.parse().ok()?;
+        if !(0.0..=100.0).contains(&percentile) {
+            return None;
+        }
+        let bucket = self.buckets.get(bucket_id as usize)?;
+        // DDSketch.quantile is a pure read; calling it here for the cutoff sort does
+        // not affect the intermediate state used for the final result.
+        bucket.sketch.quantile(percentile / 100.0).ok().flatten()
     }
 }
 

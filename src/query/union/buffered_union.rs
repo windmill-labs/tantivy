@@ -1,6 +1,6 @@
 use common::TinySet;
 
-use crate::docset::{DocSet, SeekDangerResult, TERMINATED};
+use crate::docset::{DocSet, SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::size_hint::estimate_union;
 use crate::query::Scorer;
@@ -55,6 +55,11 @@ pub struct BufferedUnionScorer<TScorer, TScoreCombiner = DoNothingCombiner> {
     num_docs: u32,
 }
 
+// Keep this helper out-of-line. When LLVM inlines it into
+// `BufferedUnionScorer::advance`, the full traversal path used by combined
+// collectors such as `(TopDocs, Count)` becomes sensitive to unrelated codegen
+// changes and regresses on large unions.
+#[inline(never)]
 fn refill<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
     scorers: &mut Vec<TScorer>,
     bitsets: &mut [TinySet; HORIZON_NUM_TINYBITSETS],
@@ -170,6 +175,46 @@ where
             return TERMINATED;
         }
         self.doc
+    }
+
+    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
+        if self.doc == TERMINATED {
+            return 0;
+        }
+        // The current doc (self.doc) has already been popped from the bitsets,
+        // so the loop below won't yield it. Emit it here first.
+        buffer[0] = self.doc;
+        let mut count = 1;
+
+        loop {
+            // Drain docs directly from the pre-computed bitsets.
+            while self.bucket_idx < HORIZON_NUM_TINYBITSETS {
+                // Move bitset to a local variable to avoid read/store on self.bitsets while
+                // iterating through the bits.
+                let mut tinyset: TinySet = self.bitsets[self.bucket_idx];
+
+                while let Some(val) = tinyset.pop_lowest() {
+                    let delta = val + (self.bucket_idx as u32) * 64;
+                    self.doc = self.window_start_doc + delta;
+
+                    if count >= COLLECT_BLOCK_BUFFER_LEN {
+                        // Buffer full; put remaining bits back.
+                        self.bitsets[self.bucket_idx] = tinyset;
+                        return COLLECT_BLOCK_BUFFER_LEN;
+                    }
+                    buffer[count] = self.doc;
+                    count += 1;
+                }
+                self.bitsets[self.bucket_idx] = TinySet::empty();
+                self.bucket_idx += 1;
+            }
+
+            // Current window exhausted, refill.
+            if !self.refill() {
+                self.doc = TERMINATED;
+                return count;
+            }
+        }
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
