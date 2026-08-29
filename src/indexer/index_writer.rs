@@ -448,13 +448,19 @@ impl<D: Document> IndexWriter<D> {
                         return Ok(());
                     }
 
-                    index_documents(
+                    // Skip the batch instead of propagating: `?` here returns from
+                    // the worker closure, which kills the indexing thread for the
+                    // life of the writer. One malformed document would then stop
+                    // all further indexing rather than losing just itself.
+                    if let Err(e) = index_documents(
                         mem_budget,
                         index.new_segment(),
                         &mut document_iterator,
                         &segment_updater,
                         delete_cursor.clone(),
-                    )?;
+                    ) {
+                        error!("error indexing documents, skipping batch: {e:?}");
+                    }
                 }
             })?;
         self.worker_id += 1;
